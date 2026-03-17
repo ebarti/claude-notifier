@@ -6,6 +6,7 @@ import UserNotifications
 let appVersion = "1.0.0"
 let defaultTitle = "Claude Code"
 let defaultSound = "default"
+let listenerTimeout: TimeInterval = 300 // 5 minutes
 
 // MARK: - Usage
 
@@ -49,7 +50,7 @@ struct NotificationArgs {
 func parseArguments() -> NotificationArgs {
     let args = CommandLine.arguments
     var parsed = NotificationArgs()
-    var i = 1 // skip executable name
+    var i = 1
 
     while i < args.count {
         switch args[i] {
@@ -119,6 +120,9 @@ func parseArguments() -> NotificationArgs {
                 exit(1)
             }
             parsed.timeout = seconds
+        case "-listen":
+            // Internal flag: run as background click listener.
+            break
         default:
             fputs("Error: Unknown option '\(args[i])'. Use -help for usage.\n", stderr)
             exit(1)
@@ -141,7 +145,6 @@ func readStdin() -> String? {
 
 // MARK: - JSON Stdin Parsing (Claude Code hook support)
 
-/// Default sounds per notification type.
 let notificationTypeSounds: [String: String] = [
     "permission_prompt": "Funk",
     "idle_prompt": "default",
@@ -149,7 +152,6 @@ let notificationTypeSounds: [String: String] = [
     "elicitation_dialog": "Blow"
 ]
 
-/// Default titles per notification type.
 let notificationTypeTitles: [String: String] = [
     "permission_prompt": "Permission Needed",
     "idle_prompt": "Claude Code",
@@ -157,14 +159,12 @@ let notificationTypeTitles: [String: String] = [
     "elicitation_dialog": "Input Required"
 ]
 
-/// Try to parse stdin as Claude Code hook JSON. Returns populated args if successful.
 func parseHookJSON(_ raw: String) -> NotificationArgs? {
     guard let data = raw.data(using: .utf8),
           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
         return nil
     }
 
-    // Must have a "message" field to be valid hook JSON.
     guard let message = json["message"] as? String else { return nil }
 
     var args = NotificationArgs()
@@ -172,24 +172,20 @@ func parseHookJSON(_ raw: String) -> NotificationArgs? {
 
     let notificationType = json["notification_type"] as? String
 
-    // Title: JSON field > type default > global default
     if let title = json["title"] as? String, !title.isEmpty {
         args.title = title
     } else if let nt = notificationType, let typeTitle = notificationTypeTitles[nt] {
         args.title = typeTitle
     }
 
-    // Subtitle from JSON
     if let subtitle = json["subtitle"] as? String, !subtitle.isEmpty {
         args.subtitle = subtitle
     }
 
-    // Sound: type-specific default
     if let nt = notificationType, let typeSound = notificationTypeSounds[nt] {
         args.sound = typeSound
     }
 
-    // Group: auto-set from notification_type so same-type notifications replace each other
     if let nt = notificationType {
         args.group = "claude-\(nt)"
     }
@@ -197,18 +193,82 @@ func parseHookJSON(_ raw: String) -> NotificationArgs? {
     return args
 }
 
+// MARK: - Terminal Detection
+
+let terminalBundleIDs: [String: String] = [
+    "Apple_Terminal": "com.apple.Terminal",
+    "iTerm.app": "com.googlecode.iterm2",
+    "WarpTerminal": "dev.warp.Warp-Stable",
+    "vscode": "com.microsoft.VSCode",
+    "ghostty": "com.mitchellh.ghostty",
+    "alacritty": "org.alacritty",
+    "kitty": "net.kovidgoyal.kitty",
+    "WezTerm": "com.github.wez.wezterm",
+    "tmux": "com.apple.Terminal",
+]
+
+func detectTerminalBundleID() -> String? {
+    if let termProgram = ProcessInfo.processInfo.environment["TERM_PROGRAM"],
+       let bundleID = terminalBundleIDs[termProgram] {
+        return bundleID
+    }
+    return NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+}
+
+func activateApp(bundleID: String) {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+    process.arguments = ["-b", bundleID]
+    try? process.run()
+    process.waitUntilExit()
+}
+
+// MARK: - Background Listener
+
+/// Kill any existing listener process before spawning a new one.
+func killExistingListener() {
+    let pidFile = "/tmp/claude-notifier-listener.pid"
+    if let pidStr = try? String(contentsOfFile: pidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+       let pid = Int32(pidStr) {
+        kill(pid, SIGTERM)
+        usleep(100_000) // 100ms for cleanup
+    }
+}
+
+/// Spawn a background copy of ourselves in -listen mode.
+func spawnListener() {
+    killExistingListener()
+
+    let binaryPath = CommandLine.arguments[0]
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: binaryPath)
+    process.arguments = ["-listen"]
+    // Detach stdin/stdout/stderr so the parent can exit cleanly.
+    process.standardInput = FileHandle.nullDevice
+    process.standardOutput = FileHandle.nullDevice
+    process.standardError = FileHandle.nullDevice
+    try? process.run()
+}
+
+/// Write our PID so the next notification can kill us.
+func writeListenerPID() {
+    let pidFile = "/tmp/claude-notifier-listener.pid"
+    try? "\(ProcessInfo.processInfo.processIdentifier)".write(toFile: pidFile, atomically: true, encoding: .utf8)
+}
+
+func cleanupListenerPID() {
+    try? FileManager.default.removeItem(atPath: "/tmp/claude-notifier-listener.pid")
+}
+
 // MARK: - Notification Delegate
 
 class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
-    var openURL: String?
-    var executeCommand: String?
 
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
-        // Show the notification even when the app is in the foreground.
         if #available(macOS 12.0, *) {
             completionHandler([.banner, .sound])
         } else {
@@ -228,21 +288,20 @@ class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                 if let url = URL(string: urlString) {
                     NSWorkspace.shared.open(url)
                 } else {
-                    // Try as a file path.
-                    let fileURL = URL(fileURLWithPath: urlString)
-                    NSWorkspace.shared.open(fileURL)
+                    NSWorkspace.shared.open(URL(fileURLWithPath: urlString))
                 }
-            }
-
-            if let command = userInfo["executeCommand"] as? String {
+            } else if let command = userInfo["executeCommand"] as? String {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: "/bin/sh")
                 process.arguments = ["-c", command]
                 try? process.run()
+            } else if let bundleID = userInfo["terminalBundleID"] as? String {
+                activateApp(bundleID: bundleID)
             }
         }
 
         completionHandler()
+        cleanupListenerPID()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             exit(0)
         }
@@ -251,117 +310,122 @@ class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
 
 // MARK: - Main
 
-var parsedArgs = parseArguments()
+let isListenerMode = CommandLine.arguments.contains("-listen")
 
-// Resolve message: CLI flags > JSON stdin > plain text stdin.
-let message: String
-if let msg = parsedArgs.message {
-    // Explicit -message flag always wins.
-    message = msg
-} else if let stdinRaw = readStdin() {
-    // Try parsing stdin as Claude Code hook JSON first.
-    if let hookArgs = parseHookJSON(stdinRaw) {
-        message = hookArgs.message!
-        // Only apply JSON defaults for fields not explicitly set via CLI flags.
-        if CommandLine.arguments.firstIndex(of: "-title") == nil {
-            parsedArgs.title = hookArgs.title
-        }
-        if CommandLine.arguments.firstIndex(of: "-subtitle") == nil {
-            parsedArgs.subtitle = hookArgs.subtitle
-        }
-        if CommandLine.arguments.firstIndex(of: "-sound") == nil {
-            parsedArgs.sound = hookArgs.sound
-        }
-        if CommandLine.arguments.firstIndex(of: "-group") == nil {
-            parsedArgs.group = hookArgs.group
-        }
-    } else {
-        // Plain text stdin.
-        message = stdinRaw
-    }
-} else {
-    fputs("Error: No message provided. Use -message or pipe via stdin.\n", stderr)
-    exit(1)
-}
-
-// Set up the application (required for notification delivery from a .app bundle).
 let app = NSApplication.shared
-app.setActivationPolicy(.accessory) // No Dock icon.
+app.setActivationPolicy(.accessory)
 
-let delegate = NotificationDelegate()
+let notificationDelegate = NotificationDelegate()
 let center = UNUserNotificationCenter.current()
-center.delegate = delegate
+center.delegate = notificationDelegate
 
-// Request authorization.
-let semaphore = DispatchSemaphore(value: 0)
-var authGranted = false
-
-center.requestAuthorization(options: [.alert, .sound]) { granted, error in
-    if let error = error {
-        fputs("Error: Authorization failed: \(error.localizedDescription)\n", stderr)
-        exit(1)
-    }
-    authGranted = granted
-    semaphore.signal()
-}
-
-semaphore.wait()
-
-if !authGranted {
-    fputs("Warning: Notification permission not granted. Notification may not appear.\n", stderr)
-}
-
-// Build notification content.
-let content = UNMutableNotificationContent()
-content.title = parsedArgs.title
-content.body = message
-
-if let subtitle = parsedArgs.subtitle {
-    content.subtitle = subtitle
-}
-
-if parsedArgs.sound == "default" {
-    content.sound = .default
-} else {
-    content.sound = UNNotificationSound(named: UNNotificationSoundName(rawValue: parsedArgs.sound))
-}
-
-var userInfo: [String: String] = [:]
-if let openURL = parsedArgs.openURL {
-    userInfo["openURL"] = openURL
-}
-if let execute = parsedArgs.execute {
-    userInfo["executeCommand"] = execute
-}
-if !userInfo.isEmpty {
-    content.userInfo = userInfo
-}
-
-// Use the group ID as the request identifier so that notifications in the
-// same group replace each other.
-let identifier = parsedArgs.group ?? UUID().uuidString
-
-var trigger: UNNotificationTrigger? = nil
-if parsedArgs.timeout > 0 {
-    trigger = UNTimeIntervalNotificationTrigger(timeInterval: parsedArgs.timeout, repeats: false)
-}
-
-let request = UNNotificationRequest(identifier: identifier, content: content, trigger: trigger)
-
-// Deliver the notification.
-center.add(request) { error in
-    if let error = error {
-        fputs("Error: Failed to deliver notification: \(error.localizedDescription)\n", stderr)
-        exit(1)
-    }
-
-    // Safety timeout: exit after a short delay if the delegate never fires
-    // (e.g., user doesn't click the notification).
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+if isListenerMode {
+    // Background listener mode: stay alive to handle notification clicks.
+    writeListenerPID()
+    DispatchQueue.main.asyncAfter(deadline: .now() + listenerTimeout) {
+        cleanupListenerPID()
         exit(0)
     }
-}
+    app.run()
+} else {
+    // Normal mode: post notification, spawn listener, exit.
+    var parsedArgs = parseArguments()
 
-// Run the main event loop so the app can deliver the notification and
-// handle click responses.
-app.run()
+    let message: String
+    if let msg = parsedArgs.message {
+        message = msg
+    } else if let stdinRaw = readStdin() {
+        if let hookArgs = parseHookJSON(stdinRaw) {
+            message = hookArgs.message!
+            if CommandLine.arguments.firstIndex(of: "-title") == nil {
+                parsedArgs.title = hookArgs.title
+            }
+            if CommandLine.arguments.firstIndex(of: "-subtitle") == nil {
+                parsedArgs.subtitle = hookArgs.subtitle
+            }
+            if CommandLine.arguments.firstIndex(of: "-sound") == nil {
+                parsedArgs.sound = hookArgs.sound
+            }
+            if CommandLine.arguments.firstIndex(of: "-group") == nil {
+                parsedArgs.group = hookArgs.group
+            }
+        } else {
+            message = stdinRaw
+        }
+    } else {
+        fputs("Error: No message provided. Use -message or pipe via stdin.\n", stderr)
+        exit(1)
+    }
+
+    // Request authorization.
+    let semaphore = DispatchSemaphore(value: 0)
+    var authGranted = false
+
+    center.requestAuthorization(options: [.alert, .sound]) { granted, error in
+        if let error = error {
+            fputs("Error: Authorization failed: \(error.localizedDescription)\n", stderr)
+            exit(1)
+        }
+        authGranted = granted
+        semaphore.signal()
+    }
+
+    semaphore.wait()
+
+    if !authGranted {
+        fputs("Warning: Notification permission not granted. Notification may not appear.\n", stderr)
+    }
+
+    // Build notification content.
+    let content = UNMutableNotificationContent()
+    content.title = parsedArgs.title
+    content.body = message
+
+    if let subtitle = parsedArgs.subtitle {
+        content.subtitle = subtitle
+    }
+
+    if parsedArgs.sound == "default" {
+        content.sound = .default
+    } else {
+        content.sound = UNNotificationSound(named: UNNotificationSoundName(rawValue: parsedArgs.sound))
+    }
+
+    var userInfo: [String: String] = [:]
+    if let openURL = parsedArgs.openURL {
+        userInfo["openURL"] = openURL
+    }
+    if let execute = parsedArgs.execute {
+        userInfo["executeCommand"] = execute
+    }
+    if let termBundleID = detectTerminalBundleID() {
+        userInfo["terminalBundleID"] = termBundleID
+    }
+    content.userInfo = userInfo
+
+    let identifier = parsedArgs.group ?? UUID().uuidString
+
+    var trigger: UNNotificationTrigger? = nil
+    if parsedArgs.timeout > 0 {
+        trigger = UNTimeIntervalNotificationTrigger(timeInterval: parsedArgs.timeout, repeats: false)
+    }
+
+    let request = UNNotificationRequest(identifier: identifier, content: content, trigger: trigger)
+
+    // Deliver the notification.
+    center.add(request) { error in
+        if let error = error {
+            fputs("Error: Failed to deliver notification: \(error.localizedDescription)\n", stderr)
+            exit(1)
+        }
+
+        // Spawn a background listener to handle clicks, then exit.
+        spawnListener()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            exit(0)
+        }
+    }
+
+    app.run()
+}
