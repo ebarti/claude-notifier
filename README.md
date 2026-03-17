@@ -9,13 +9,13 @@ macOS requires a `.app` bundle to post notifications — bare CLI binaries can't
 ### Homebrew
 
 ```bash
-brew install eloibarti/tap/claude-notifier
+brew install ebarti/tap/claude-notifier
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/eloibarti/claude-notifier.git
+git clone https://github.com/ebarti/claude-notifier.git
 cd claude-notifier
 make install
 ```
