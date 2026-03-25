@@ -3,7 +3,7 @@ import UserNotifications
 
 // MARK: - Constants
 
-let appVersion = "1.0.0"
+let appVersion = "1.1.0"
 let defaultTitle = "Claude Code"
 let defaultSound = "default"
 let listenerTimeout: TimeInterval = 300 // 5 minutes
@@ -215,12 +215,87 @@ func detectTerminalBundleID() -> String? {
     return NSWorkspace.shared.frontmostApplication?.bundleIdentifier
 }
 
-func activateApp(bundleID: String) {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-    process.arguments = ["-b", bundleID]
-    try? process.run()
-    process.waitUntilExit()
+/// Find all window names for the detected terminal app.
+/// Returns the best match for the invoking terminal window by checking
+/// if any window title contains the current working directory.
+/// Falls back to the frontmost window if no directory match is found.
+func detectTerminalWindowName(bundleID: String) -> String? {
+    guard let windowList = CGWindowListCopyWindowInfo(
+        [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
+    ) as? [[String: Any]] else {
+        return nil
+    }
+
+    let cwd = FileManager.default.currentDirectoryPath
+    let cwdLastComponent = (cwd as NSString).lastPathComponent
+    var allWindows: [String] = []
+
+    for window in windowList {
+        guard let layer = window[kCGWindowLayer as String] as? Int, layer == 0,
+              let ownerPID = window[kCGWindowOwnerPID as String] as? Int32,
+              let windowName = window[kCGWindowName as String] as? String,
+              !windowName.isEmpty else {
+            continue
+        }
+
+        if let app = NSRunningApplication(processIdentifier: ownerPID),
+           app.bundleIdentifier == bundleID {
+            allWindows.append(windowName)
+        }
+    }
+
+    // Try to match a window whose title contains the working directory
+    if let match = allWindows.first(where: { $0.contains(cwd) }) {
+        return match
+    }
+    if let match = allWindows.first(where: { $0.contains(cwdLastComponent) }) {
+        return match
+    }
+
+    // Fall back to frontmost window of the app
+    return allWindows.first
+}
+
+func activateApp(bundleID: String, windowName: String? = nil) {
+    // Activate the application
+    let apps = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+    if let app = apps.first {
+        if #available(macOS 14.0, *) {
+            app.activate()
+        } else {
+            app.activate(options: [.activateIgnoringOtherApps])
+        }
+    }
+
+    // If we have a window name, try to raise the specific window via AppleScript
+    if let windowName = windowName,
+       let processName = apps.first?.localizedName {
+        let escapedWindow = windowName.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let escapedProcess = processName.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        // Try exact match first, then contains match for resilience against title changes
+        let script = """
+            tell application "System Events"
+                tell process "\(escapedProcess)"
+                    try
+                        perform action "AXRaise" of (first window whose name is "\(escapedWindow)")
+                    on error
+                        try
+                            perform action "AXRaise" of (first window whose name contains "\(escapedWindow)")
+                        end try
+                    end try
+                end tell
+            end tell
+            """
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", script]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
+        process.waitUntilExit()
+    }
 }
 
 // MARK: - Background Listener
@@ -296,7 +371,8 @@ class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                 process.arguments = ["-c", command]
                 try? process.run()
             } else if let bundleID = userInfo["terminalBundleID"] as? String {
-                activateApp(bundleID: bundleID)
+                let windowName = userInfo["terminalWindowName"] as? String
+                activateApp(bundleID: bundleID, windowName: windowName)
             }
         }
 
@@ -400,6 +476,9 @@ if isListenerMode {
     }
     if let termBundleID = detectTerminalBundleID() {
         userInfo["terminalBundleID"] = termBundleID
+        if let windowName = detectTerminalWindowName(bundleID: termBundleID) {
+            userInfo["terminalWindowName"] = windowName
+        }
     }
     content.userInfo = userInfo
 
